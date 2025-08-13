@@ -15,17 +15,31 @@ export async function GET(request: NextRequest) {
     const error = searchParams.get("error");
     const installationId = searchParams.get("installation_id");
 
+    // Get the base URL from the configured redirect URI to ensure consistent redirects
+    const redirectUri = process.env.GITHUB_APP_REDIRECT_URI;
+    const baseUrl = redirectUri ? new URL(redirectUri).origin : new URL(request.url).origin;
+    
+    // Debug logging
+    console.log('GitHub callback debug:', {
+      requestUrl: request.url,
+      configuredRedirectUri: redirectUri,
+      baseUrl: baseUrl,
+      code: code ? 'present' : 'missing',
+      state: state ? 'present' : 'missing',
+      error: error || 'none'
+    });
+
     // Handle GitHub App errors
     if (error) {
       return NextResponse.redirect(
-        new URL(`/?error=${encodeURIComponent(error)}`, request.url),
+        new URL(`/?error=${encodeURIComponent(error)}`, baseUrl),
       );
     }
 
     // Validate required parameters
     if (!code) {
       return NextResponse.redirect(
-        new URL("/?error=missing_code_parameter", request.url),
+        new URL("/?error=missing_code_parameter", baseUrl),
       );
     }
 
@@ -34,17 +48,16 @@ export async function GET(request: NextRequest) {
 
     if (storedState && state !== storedState) {
       return NextResponse.redirect(
-        new URL("/?error=invalid_state", request.url),
+        new URL("/?error=invalid_state", baseUrl),
       );
     }
 
     const clientId = process.env.NEXT_PUBLIC_GITHUB_APP_CLIENT_ID;
     const clientSecret = process.env.GITHUB_APP_CLIENT_SECRET;
-    const redirectUri = process.env.GITHUB_APP_REDIRECT_URI;
 
     if (!clientId || !clientSecret || !redirectUri) {
       return NextResponse.redirect(
-        new URL("/?error=configuration_missing", request.url),
+        new URL("/?error=configuration_missing", baseUrl),
       );
     }
 
@@ -69,7 +82,7 @@ export async function GET(request: NextRequest) {
     if (!tokenResponse.ok) {
       console.error("Token exchange failed:", await tokenResponse.text());
       return NextResponse.redirect(
-        new URL("/?error=token_exchange_failed", request.url),
+        new URL("/?error=token_exchange_failed", baseUrl),
       );
     }
 
@@ -77,12 +90,12 @@ export async function GET(request: NextRequest) {
 
     if (tokenData.error) {
       return NextResponse.redirect(
-        new URL(`/?error=${encodeURIComponent(tokenData.error)}`, request.url),
+        new URL(`/?error=${encodeURIComponent(tokenData.error)}`, baseUrl),
       );
     }
 
     // Create the success response
-    const response = NextResponse.redirect(new URL("/chat", request.url));
+    const response = NextResponse.redirect(new URL("/chat", baseUrl));
 
     // Clear the state cookie as it's no longer needed
     response.cookies.set(GITHUB_AUTH_STATE_COOKIE, "", {
@@ -123,8 +136,11 @@ export async function GET(request: NextRequest) {
     return response;
   } catch (error) {
     console.error("GitHub App callback error:", error);
+    // Use the configured redirect URI's origin instead of request.url to avoid localhost redirect
+    const fallbackRedirectUri = process.env.GITHUB_APP_REDIRECT_URI;
+    const fallbackBaseUrl = fallbackRedirectUri ? new URL(fallbackRedirectUri).origin : new URL(request.url).origin;
     return NextResponse.redirect(
-      new URL("/?error=callback_failed", request.url),
+      new URL("/?error=callback_failed", fallbackBaseUrl),
     );
   }
 }
