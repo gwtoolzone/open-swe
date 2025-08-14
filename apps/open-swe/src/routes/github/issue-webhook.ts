@@ -40,9 +40,18 @@ const webhooks = new Webhooks({
 
 const getPayload = (body: string): Record<string, any> | null => {
   try {
+    logger.info("Parsing webhook payload", { bodyLength: body.length });
     const payload = JSON.parse(body);
+    logger.info("Successfully parsed webhook payload", {
+      action: payload.action,
+      issueNumber: payload.issue?.number,
+      labelName: payload.label?.name,
+      repository: payload.repository?.full_name,
+      sender: payload.sender?.login
+    });
     return payload;
-  } catch {
+  } catch (error) {
+    logger.error("Failed to parse webhook payload", { error: (error as Error).message, bodyLength: body.length });
     return null;
   }
 };
@@ -74,26 +83,63 @@ const getHeaders = (
   const webhookEvent = headers["x-github-event"] || "";
   const installationId = headers["x-github-hook-installation-target-id"] || "";
   const targetType = headers["x-github-hook-installation-target-type"] || "";
+  
+  logger.info("Extracting webhook headers", {
+    webhookId: webhookId || "missing",
+    webhookEvent: webhookEvent || "missing",
+    installationId: installationId || "missing",
+    targetType: targetType || "missing"
+  });
+  
   if (!webhookId || !webhookEvent || !installationId || !targetType) {
+    logger.error("Missing required webhook headers", {
+      missingHeaders: {
+        webhookId: !webhookId,
+        webhookEvent: !webhookEvent,
+        installationId: !installationId,
+        targetType: !targetType
+      }
+    });
     return null;
   }
+  
+  logger.info("Successfully extracted all required webhook headers");
   return { id: webhookId, name: webhookEvent, installationId, targetType };
 };
 
 webhooks.on("issues.labeled", async ({ payload }) => {
+  logger.info("Processing issues.labeled webhook event", {
+    issueNumber: payload.issue?.number,
+    labelName: payload.label?.name,
+    repository: payload.repository?.full_name,
+    sender: payload.sender?.login
+  });
+  
   if (!process.env.SECRETS_ENCRYPTION_KEY) {
+    logger.error("SECRETS_ENCRYPTION_KEY environment variable is required");
     throw new Error("SECRETS_ENCRYPTION_KEY environment variable is required");
   }
+  
   const validOpenSWELabels = [
     getOpenSWELabel(),
     getOpenSWEAutoAcceptLabel(),
     getOpenSWEMaxLabel(),
     getOpenSWEMaxAutoAcceptLabel(),
   ];
+  
+  logger.info("Checking if label is valid Open SWE label", {
+    labelName: payload.label?.name,
+    validLabels: validOpenSWELabels,
+    isValidLabel: validOpenSWELabels.some((l) => l === payload.label?.name)
+  });
+  
   if (
     !payload.label?.name ||
     !validOpenSWELabels.some((l) => l === payload.label?.name)
   ) {
+    logger.info("Ignoring event - not a valid Open SWE label", {
+      labelName: payload.label?.name
+    });
     return;
   }
   const isAutoAcceptLabel =
@@ -113,18 +159,28 @@ webhooks.on("issues.labeled", async ({ payload }) => {
   );
 
   try {
+    logger.info("Starting webhook processing for valid Open SWE label");
+    
     // Get installation ID from the webhook payload
     const installationId = payload.installation?.id;
 
     if (!installationId) {
-      logger.error("No installation ID found in webhook payload");
+      logger.error("No installation ID found in webhook payload", {
+        payloadKeys: Object.keys(payload)
+      });
       return;
     }
+    
+    logger.info("Found installation ID, getting GitHub authentication", {
+      installationId
+    });
 
     const [octokit, { token }] = await Promise.all([
       githubApp.getInstallationOctokit(installationId),
       githubApp.getInstallationAccessToken(installationId),
     ]);
+    
+    logger.info("Successfully obtained GitHub authentication");
     const issueData = {
       owner: payload.repository.owner.login,
       repo: payload.repository.name,
@@ -135,13 +191,22 @@ webhooks.on("issues.labeled", async ({ payload }) => {
       userLogin: payload.sender.login,
     };
 
+    logger.info("Checking user permissions", {
+      userLogin: issueData.userLogin,
+      userId: issueData.userId
+    });
+    
     if (!isAllowedUser(issueData.userLogin)) {
       logger.error("User is not a member of allowed orgs", {
         username: issueData.userLogin,
       });
       return;
     }
+    
+    logger.info("User permission check passed");
 
+    logger.info("Creating LangGraph client with authentication headers");
+    
     const langGraphClient = createLangGraphClient({
       defaultHeaders: {
         [GITHUB_INSTALLATION_TOKEN_COOKIE]: encryptSecret(
@@ -154,8 +219,20 @@ webhooks.on("issues.labeled", async ({ payload }) => {
         [GITHUB_INSTALLATION_ID]: installationId.toString(),
       },
     });
+    
+    logger.info("LangGraph client created successfully");
 
     const threadId = uuidv4();
+    
+    logger.info("Preparing run input and configuration", {
+      threadId,
+      issueNumber: issueData.issueNumber,
+      autoAcceptPlan: isAutoAcceptLabel,
+      isMaxLabel,
+      issueTitle: issueData.issueTitle,
+      issueBodyLength: issueData.issueBody.length
+    });
+    
     const runInput: ManagerGraphUpdate = {
       messages: [
         new HumanMessage({
@@ -175,24 +252,38 @@ webhooks.on("issues.labeled", async ({ payload }) => {
       },
       autoAcceptPlan: isAutoAcceptLabel,
     };
+    
     // Create config object with Claude Opus 4.1 model configuration for max labels
     const config: Record<string, any> = {
       recursion_limit: 400,
     };
 
     if (isMaxLabel) {
+      logger.info("Using Claude Opus 4.1 model for max label");
       config.configurable = {
         plannerModelName: "anthropic:claude-opus-4-1",
         programmerModelName: "anthropic:claude-opus-4-1",
       };
     }
 
+    logger.info("Creating LangGraph run", {
+      threadId,
+      graphId: MANAGER_GRAPH_ID,
+      configRecursionLimit: config.recursion_limit,
+      hasConfigurable: !!config.configurable
+    });
+    
     const run = await langGraphClient.runs.create(threadId, MANAGER_GRAPH_ID, {
       input: runInput,
       config,
       ifNotExists: "create",
       streamResumable: true,
       streamMode: OPEN_SWE_STREAM_MODE as StreamMode[],
+    });
+    
+    logger.info("LangGraph run created successfully", {
+      runId: run.run_id,
+      threadId
     });
 
     logger.info("Created new run from GitHub issue.", {
@@ -206,11 +297,22 @@ webhooks.on("issues.labeled", async ({ payload }) => {
       autoAcceptPlan: isAutoAcceptLabel,
     });
 
-    logger.info("Creating comment...");
+    logger.info("Creating GitHub issue comment", {
+      owner: issueData.owner,
+      repo: issueData.repo,
+      issueNumber: issueData.issueNumber
+    });
+    
     const appUrl = getOpenSweAppUrl(threadId);
     const appUrlCommentText = appUrl
       ? `View run in Open SWE [here](${appUrl}) (this URL will only work for @${issueData.userLogin})`
       : "";
+      
+    logger.info("Generated app URL for comment", {
+      hasAppUrl: !!appUrl,
+      appUrl: appUrl || "not generated"
+    });
+    
     await octokit.request(
       "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
       {
@@ -220,17 +322,61 @@ webhooks.on("issues.labeled", async ({ payload }) => {
         body: `🤖 Open SWE has been triggered for this issue. Processing...\n\n${appUrlCommentText}\n\n${createDevMetadataComment(run.run_id, threadId)}`,
       },
     );
+    
+    logger.info("GitHub issue comment created successfully");
   } catch (error) {
-    logger.error("Error processing webhook:", error);
+    logger.error("Error processing webhook event", {
+      error: (error as Error).message,
+      stack: (error as Error).stack,
+      issueNumber: payload.issue?.number,
+      repository: payload.repository?.full_name,
+      labelName: payload.label?.name,
+      sender: payload.sender?.login,
+      installationId: payload.installation?.id
+    });
+    
+    // Try to add an error comment to the issue if possible
+    try {
+      if (payload.installation?.id && payload.repository && payload.issue) {
+        logger.info("Attempting to add error comment to GitHub issue");
+        const [octokit] = await Promise.all([
+          githubApp.getInstallationOctokit(payload.installation.id),
+        ]);
+        
+        await octokit.request(
+          "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
+          {
+            owner: payload.repository.owner.login,
+            repo: payload.repository.name,
+            issue_number: payload.issue.number,
+            body: `❌ Open SWE encountered an error while processing this issue. Please check the logs or try again later.\n\nError: ${(error as Error).message}`,
+          },
+        );
+        
+        logger.info("Error comment added to GitHub issue successfully");
+      }
+    } catch (commentError) {
+      logger.error("Failed to add error comment to GitHub issue", {
+        commentError: (commentError as Error).message
+      });
+    }
   }
 });
 
 export async function issueWebhookHandler(
   c: Context<BlankEnv, "/webhooks/github", BlankInput>,
 ) {
-  const payload = getPayload(await c.req.text());
+  logger.info("Received GitHub webhook request", {
+    method: c.req.method,
+    url: c.req.url,
+    userAgent: c.req.header("user-agent"),
+    contentType: c.req.header("content-type")
+  });
+  
+  const requestBody = await c.req.text();
+  const payload = getPayload(requestBody);
   if (!payload) {
-    logger.error("Missing payload");
+    logger.error("Missing or invalid payload");
     return c.json({ error: "Missing payload" }, { status: 400 });
   }
 
@@ -241,15 +387,32 @@ export async function issueWebhookHandler(
   }
 
   try {
+    logger.info("Processing webhook with GitHub webhooks library", {
+      eventId: eventHeaders.id,
+      eventName: eventHeaders.name,
+      installationId: eventHeaders.installationId,
+      targetType: eventHeaders.targetType
+    });
+    
     await webhooks.receive({
       id: eventHeaders.id,
       name: eventHeaders.name as any,
       payload,
     });
 
+    logger.info("Webhook processed successfully", {
+      eventId: eventHeaders.id,
+      eventName: eventHeaders.name
+    });
+    
     return c.json({ received: true });
   } catch (error) {
-    logger.error("Webhook error:", error);
+    logger.error("Webhook processing failed", {
+      error: (error as Error).message,
+      eventId: eventHeaders.id,
+      eventName: eventHeaders.name,
+      stack: (error as Error).stack
+    });
     return c.json({ error: "Webhook processing failed" }, { status: 400 });
   }
 }

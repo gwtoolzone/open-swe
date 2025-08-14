@@ -57,10 +57,30 @@ export async function classifyMessage(
   state: ManagerGraphState,
   config: GraphConfig,
 ): Promise<Command> {
+  logger.info("Starting message classification", {
+    messagesCount: state.messages.length,
+    githubIssueId: state.githubIssueId,
+    targetRepository: state.targetRepository,
+    hasTaskPlan: !!state.taskPlan,
+    hasPlannerSession: !!state.plannerSession,
+    hasProgrammerSession: !!state.programmerSession
+  });
+  
   const userMessage = state.messages.findLast(isHumanMessage);
   if (!userMessage) {
+    logger.error("No human message found in state", {
+      messagesCount: state.messages.length,
+      messageTypes: state.messages.map(msg => msg._getType())
+    });
     throw new Error("No human message found.");
   }
+  
+  logger.info("Found user message for classification", {
+    messageId: userMessage.id,
+    messageLength: getMessageContentString(userMessage.content).length,
+    requestSource: userMessage.additional_kwargs?.requestSource,
+    githubIssueId: userMessage.additional_kwargs?.githubIssueId
+  });
 
   let plannerThread: Thread<PlannerGraphState> | undefined;
   let programmerThread: Thread<GraphState> | undefined;
@@ -68,29 +88,74 @@ export async function classifyMessage(
 
   if (!isLocalMode(config)) {
     // Only create LangGraph client if not in local mode
+    logger.info("Creating LangGraph client for thread status checks");
     langGraphClient = createLangGraphClient({
       defaultHeaders: getDefaultHeaders(config),
     });
 
-    plannerThread = state.plannerSession?.threadId
-      ? await langGraphClient.threads.get(state.plannerSession.threadId)
-      : undefined;
+    if (state.plannerSession?.threadId) {
+      logger.info("Fetching planner thread status", {
+        threadId: state.plannerSession.threadId
+      });
+      plannerThread = await langGraphClient.threads.get(state.plannerSession.threadId);
+      logger.info("Planner thread status retrieved", {
+        threadId: state.plannerSession.threadId,
+        status: plannerThread?.status,
+        hasValues: !!plannerThread?.values
+      });
+    }
+    
     const plannerThreadValues = plannerThread?.values;
-    programmerThread = plannerThreadValues?.programmerSession?.threadId
-      ? await langGraphClient.threads.get(
-          plannerThreadValues.programmerSession.threadId,
-        )
-      : undefined;
+    if (plannerThreadValues?.programmerSession?.threadId) {
+      logger.info("Fetching programmer thread status", {
+        threadId: plannerThreadValues.programmerSession.threadId
+      });
+      programmerThread = await langGraphClient.threads.get(
+        plannerThreadValues.programmerSession.threadId,
+      );
+      logger.info("Programmer thread status retrieved", {
+        threadId: plannerThreadValues.programmerSession.threadId,
+        status: programmerThread?.status
+      });
+    }
+  } else {
+    logger.info("Running in local mode, skipping thread status checks");
   }
 
   const programmerStatus = programmerThread?.status ?? "not_started";
   const plannerStatus = plannerThread?.status ?? "not_started";
+  
+  logger.info("Thread status summary", {
+    programmerStatus,
+    plannerStatus,
+    isLocalMode: isLocalMode(config)
+  });
 
   // If the githubIssueId is defined, fetch the most recent task plan (if exists). Otherwise fallback to state task plan
-  const issuePlans = state.githubIssueId
-    ? await getPlansFromIssue(state, config)
-    : null;
+  let issuePlans = null;
+  if (state.githubIssueId) {
+    logger.info("Fetching plans from GitHub issue", {
+      githubIssueId: state.githubIssueId
+    });
+    issuePlans = await getPlansFromIssue(state, config);
+    logger.info("Plans retrieved from GitHub issue", {
+      hasTaskPlan: !!issuePlans?.taskPlan,
+      hasProposedPlan: !!issuePlans?.proposedPlan
+    });
+  } else {
+    logger.info("No GitHub issue ID, using state task plan");
+  }
+  
   const taskPlan = issuePlans?.taskPlan ?? state.taskPlan;
+  
+  logger.info("Creating classification prompt and schema", {
+    programmerStatus,
+    plannerStatus,
+    messagesCount: state.messages.length,
+    hasTaskPlan: !!taskPlan,
+    hasProposedPlan: !!issuePlans?.proposedPlan,
+    requestSource: userMessage.additional_kwargs?.requestSource
+  });
 
   const { prompt, schema } = createClassificationPromptAndToolSchema({
     programmerStatus,
@@ -107,11 +172,18 @@ export async function classifyMessage(
     description: "Respond to the user's message and determine how to route it.",
     schema,
   };
+  
+  logger.info("Loading router model");
   const model = await loadModel(config, LLMTask.ROUTER);
   const modelSupportsParallelToolCallsParam = supportsParallelToolCallsParam(
     config,
     LLMTask.ROUTER,
   );
+  
+  logger.info("Binding tools to model", {
+    supportsParallelToolCalls: modelSupportsParallelToolCallsParam
+  });
+  
   const modelWithTools = model.bindTools([respondAndRouteTool], {
     tool_choice: respondAndRouteTool.name,
     ...(modelSupportsParallelToolCallsParam
@@ -121,6 +193,15 @@ export async function classifyMessage(
       : {}),
   });
 
+  const userContent = extractContentWithoutDetailsFromIssueBody(
+    getMessageContentString(userMessage.content),
+  );
+  
+  logger.info("Invoking router model for classification", {
+    userContentLength: userContent.length,
+    promptLength: prompt.length
+  });
+
   const response = await modelWithTools.invoke([
     {
       role: "system",
@@ -128,21 +209,33 @@ export async function classifyMessage(
     },
     {
       role: "user",
-      content: extractContentWithoutDetailsFromIssueBody(
-        getMessageContentString(userMessage.content),
-      ),
+      content: userContent,
     },
   ]);
 
   const toolCall = response.tool_calls?.[0];
   if (!toolCall) {
+    logger.error("No tool call found in model response", {
+      responseType: typeof response,
+      hasToolCalls: !!response.tool_calls,
+      toolCallsLength: response.tool_calls?.length || 0
+    });
     throw new Error("No tool call found.");
   }
+  
   const toolCallArgs = toolCall.args as z.infer<
     typeof BASE_CLASSIFICATION_SCHEMA
   >;
+  
+  logger.info("Classification completed", {
+    route: toolCallArgs.route,
+    hasResponse: !!toolCallArgs.response,
+    hasInternalReasoning: !!toolCallArgs.internal_reasoning,
+    responseLength: toolCallArgs.response?.length || 0
+  });
 
   if (toolCallArgs.route === "no_op") {
+    logger.info("Route decision: no_op - ending workflow");
     // If it's a no_op, just add the message to the state and return.
     const commandUpdate: ManagerGraphUpdate = {
       messages: [response],
@@ -154,6 +247,7 @@ export async function classifyMessage(
   }
 
   if ((toolCallArgs.route as string) === "create_new_issue") {
+    logger.info("Route decision: create_new_issue - creating new session");
     // Route to node which kicks off new manager run, passing in the full conversation history.
     const commandUpdate: ManagerGraphUpdate = {
       messages: [response],
@@ -165,6 +259,9 @@ export async function classifyMessage(
   }
 
   if (isLocalMode(config)) {
+    logger.info("Running in local mode - simplified routing", {
+      route: toolCallArgs.route
+    });
     // In local mode, just route to planner without GitHub issue creation
     const newMessages: BaseMessage[] = [response];
     const commandUpdate: ManagerGraphUpdate = {
@@ -175,12 +272,16 @@ export async function classifyMessage(
       toolCallArgs.route === "start_planner" ||
       toolCallArgs.route === "start_planner_for_followup"
     ) {
+      logger.info("Local mode: routing to start-planner");
       return new Command({
         update: commandUpdate,
         goto: "start-planner",
       });
     }
 
+    logger.error("Unsupported route for local mode", {
+      route: toolCallArgs.route
+    });
     throw new Error(
       `Unsupported route for local mode received: ${toolCallArgs.route}`,
     );
@@ -193,6 +294,8 @@ export async function classifyMessage(
 
   // If it's not a no_op, ensure there is a GitHub issue with the user's request.
   if (!githubIssueId) {
+    logger.info("No GitHub issue ID found, creating new issue");
+    
     const { title } = await createIssueFieldsFromMessages(
       state.messages,
       config.configurable,
@@ -201,6 +304,13 @@ export async function classifyMessage(
       getMessageContentString(userMessage.content),
     );
 
+    logger.info("Creating GitHub issue", {
+      owner: state.targetRepository.owner,
+      repo: state.targetRepository.repo,
+      titleLength: title.length,
+      bodyLength: body.length
+    });
+
     const newIssue = await createIssue({
       owner: state.targetRepository.owner,
       repo: state.targetRepository.repo,
@@ -208,10 +318,17 @@ export async function classifyMessage(
       body: formatContentForIssueBody(body),
       githubAccessToken,
     });
+    
     if (!newIssue) {
+      logger.error("Failed to create GitHub issue");
       throw new Error("Failed to create issue.");
     }
+    
     githubIssueId = newIssue.number;
+    logger.info("GitHub issue created successfully", {
+      issueNumber: githubIssueId,
+      issueUrl: newIssue.html_url
+    });
     // Ensure we remove the old message, and replace it with an exact copy,
     // but with the issue ID & isOriginalIssue set in additional_kwargs.
     newMessages.push(
@@ -232,6 +349,11 @@ export async function classifyMessage(
     githubIssueId &&
     state.messages.filter(isHumanMessage).length > 1
   ) {
+    logger.info("GitHub issue exists, checking for new messages to add", {
+      githubIssueId,
+      totalHumanMessages: state.messages.filter(isHumanMessage).length
+    });
+    
     // If there already is a GitHub issue ID in state, and multiple human messages, add any
     // human messages to the issue which weren't already added.
     const messagesNotInIssue = state.messages
@@ -241,7 +363,16 @@ export async function classifyMessage(
         return !message.additional_kwargs?.githubIssueId;
       });
 
-    const createCommentsPromise = messagesNotInIssue.map(async (message) => {
+    logger.info("Found messages not yet added to issue", {
+      messagesNotInIssueCount: messagesNotInIssue.length
+    });
+
+    const createCommentsPromise = messagesNotInIssue.map(async (message, index) => {
+      logger.info(`Creating issue comment ${index + 1}/${messagesNotInIssue.length}`, {
+        messageId: message.id,
+        contentLength: getMessageContentString(message.content).length
+      });
+      
       const createdIssue = await createIssueComment({
         owner: state.targetRepository.owner,
         repo: state.targetRepository.repo,
@@ -249,9 +380,19 @@ export async function classifyMessage(
         body: getMessageContentString(message.content),
         githubToken: githubAccessToken,
       });
+      
       if (!createdIssue?.id) {
+        logger.error("Failed to create issue comment", {
+          messageId: message.id,
+          githubIssueId
+        });
         throw new Error("Failed to create issue comment");
       }
+      
+      logger.info("Issue comment created successfully", {
+        commentId: createdIssue.id,
+        messageId: message.id
+      });
       newMessages.push(
         ...[
           new RemoveMessage({
